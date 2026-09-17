@@ -1,0 +1,24 @@
+# Build outputs
+build/
+build-*/
+out/
+install/
+_install*/
+cmake-build-*/
+_scratch/
+
+# Editor and OS noise
+.vs/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+desktop.ini
+
+# Local validation scratch
+_local/
+_scratch/
+
+# Install prefixes and compiler artifacts
+install*/
+*.pdb

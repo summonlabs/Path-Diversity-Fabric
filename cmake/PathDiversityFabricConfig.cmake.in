@@ -1,0 +1,22 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+if(WIN32)
+  find_package(Threads REQUIRED)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/PathDiversityFabricTargets.cmake")
+
+# Fail fast when the documented package surface is not actually exported.
+if(NOT TARGET SummonSoftwareLabs::PathDiversityFabric)
+  set(PathDiversityFabric_FOUND FALSE)
+  set(PathDiversityFabric_NOT_FOUND_MESSAGE
+      "PathDiversityFabric package did not export the SummonSoftwareLabs::PathDiversityFabric target")
+  return()
+endif()
+
+set(PathDiversityFabric_LIBRARIES SummonSoftwareLabs::PathDiversityFabric)
+set(PathDiversityFabric_INCLUDE_DIRS "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_INCLUDEDIR@")
+
+check_required_components(PathDiversityFabric)
