@@ -343,14 +343,19 @@ PD_TEST(duplicate_paths_where_forbidden_are_refused) {
   proof.request.paths[1].path = proof.request.paths[0].path;
   proof.matrix.order[1] = proof.request.paths[0].path;
   const std::vector<std::uint8_t> record = encode_proof_record(proof);
-  expect_rejection(store_with_records({}, 0, record, 1), PersistenceStatus::INTERNAL_INCONSISTENCY,
-                   false, limits, "duplicate-path");
+  expect_rejection(store_with_records({}, 0, record, 1), PersistenceStatus::DUPLICATE_PATH, false,
+                   limits, "duplicate-path");
 
-  // The record codec reports the precise cause: the store maps every invalid
-  // record encoding onto one internal-consistency status.
+  // The record codec reports the precise cause through the typed reason channel,
+  // and the store surfaces that same status rather than a generic one.
   ByteReader reader(record.data(), record.size());
   DiversityProof decoded;
-  PD_CHECK_EQ(decode_proof(reader, limits, decoded), DecodeStatus::INVALID_ENCODING);
+  DecodeFailure failure;
+  PD_CHECK_EQ(decode_proof(reader, limits, decoded, &failure), DecodeStatus::INVALID_ENCODING);
+  PD_CHECK(failure.classified());
+  PD_CHECK(failure.status == PersistenceStatus::DUPLICATE_PATH);
+  PD_CHECK_EQ(persistence_status_for(DecodeStatus::INVALID_ENCODING, failure),
+              PersistenceStatus::DUPLICATE_PATH);
 }
 
 PD_TEST(matrix_and_conflict_references_are_validated) {
@@ -361,12 +366,14 @@ PD_TEST(matrix_and_conflict_references_are_validated) {
   PD_REQUIRE(short_matrix.matrix.cells.size() == 1);
   short_matrix.matrix.cells.clear();
   expect_rejection(store_with_records({}, 0, encode_proof_record(short_matrix), 1),
-                   PersistenceStatus::INTERNAL_INCONSISTENCY, false, limits, "matrix-dimensions");
+                   PersistenceStatus::MATRIX_DIMENSION_MISMATCH, false, limits,
+                   "matrix-dimensions");
 
   DiversityProof wide_matrix = store.proof;
   wide_matrix.matrix.cells.push_back(wide_matrix.matrix.cells.front());
   expect_rejection(store_with_records({}, 0, encode_proof_record(wide_matrix), 1),
-                   PersistenceStatus::INTERNAL_INCONSISTENCY, false, limits, "matrix-extra-cell");
+                   PersistenceStatus::MATRIX_DIMENSION_MISMATCH, false, limits,
+                   "matrix-extra-cell");
 
   DiversityProof unknown_conflict = store.proof;
   SharedResource conflict;
@@ -377,14 +384,14 @@ PD_TEST(matrix_and_conflict_references_are_validated) {
   unknown_conflict.conflicts.push_back(conflict);
   unknown_conflict.conflicts_total = 1;
   expect_rejection(store_with_records({}, 0, encode_proof_record(unknown_conflict), 1),
-                   PersistenceStatus::INTERNAL_INCONSISTENCY, false, limits,
+                   PersistenceStatus::UNKNOWN_REFERENCE, false, limits,
                    "conflict-unknown-index");
 
   DiversityProof unknown_class_conflict = store.proof;
   unknown_class_conflict.classes.front().shared.push_back(conflict);
   unknown_class_conflict.classes.front().shared_total = 1;
   expect_rejection(store_with_records({}, 0, encode_proof_record(unknown_class_conflict), 1),
-                   PersistenceStatus::INTERNAL_INCONSISTENCY, false, limits,
+                   PersistenceStatus::UNKNOWN_REFERENCE, false, limits,
                    "class-conflict-unknown-index");
 }
 
@@ -397,7 +404,7 @@ PD_TEST(proven_claims_with_incomplete_evidence_are_refused) {
   DiversityProof incomplete_class = store.proof;
   incomplete_class.classes.front().evidence_complete = false;
   expect_rejection(store_with_records({}, 0, encode_proof_record(incomplete_class), 1),
-                   PersistenceStatus::INTERNAL_INCONSISTENCY, false, limits,
+                   PersistenceStatus::INCOMPLETE_EVIDENCE_CLAIM, false, limits,
                    "proven-incomplete-class");
 
   // A proven claim that also carries a conflict contradicts itself.
@@ -410,7 +417,7 @@ PD_TEST(proven_claims_with_incomplete_evidence_are_refused) {
   proven_with_conflict.conflicts.push_back(conflict);
   proven_with_conflict.conflicts_total = 1;
   expect_rejection(store_with_records({}, 0, encode_proof_record(proven_with_conflict), 1),
-                   PersistenceStatus::INTERNAL_INCONSISTENCY, false, limits,
+                   PersistenceStatus::INCOMPLETE_EVIDENCE_CLAIM, false, limits,
                    "proven-with-conflict");
 
   // A conflict list that claims fewer total conflicts than it carries is
@@ -423,6 +430,8 @@ PD_TEST(proven_claims_with_incomplete_evidence_are_refused) {
   understated.classes.front().shared_total = 1;
   understated.conflicts.push_back(conflict);
   understated.conflicts_total = 0;
+  // No public status names an internally contradictory total, so this one stays
+  // conservatively unclassified rather than being over-claimed.
   expect_rejection(store_with_records({}, 0, encode_proof_record(understated), 1),
                    PersistenceStatus::INTERNAL_INCONSISTENCY, false, limits,
                    "conflicts-total-understated");
@@ -441,7 +450,7 @@ PD_TEST(invalid_witness_subsets_are_refused) {
   count_mismatch.witness.achieved = 3;
   count_mismatch.witness.indices = {0, 1};
   expect_rejection(store_with_records({}, 0, encode_proof_record(count_mismatch), 1),
-                   PersistenceStatus::INTERNAL_INCONSISTENCY, false, limits, "witness-count");
+                   PersistenceStatus::INVALID_WITNESS, false, limits, "witness-count");
 
   DiversityProof optimistic = store.proof;
   optimistic.witness.present = true;
@@ -467,7 +476,7 @@ PD_TEST(invalid_witness_subsets_are_refused) {
   unsorted.witness.achieved = 2;
   unsorted.witness.indices = {1, 0};
   expect_rejection(store_with_records({}, 0, encode_proof_record(unsorted), 1),
-                   PersistenceStatus::INTERNAL_INCONSISTENCY, false, limits, "witness-order");
+                   PersistenceStatus::INVALID_WITNESS, false, limits, "witness-order");
 
   DiversityProof repeated = store.proof;
   repeated.witness.present = true;
@@ -475,7 +484,7 @@ PD_TEST(invalid_witness_subsets_are_refused) {
   repeated.witness.achieved = 2;
   repeated.witness.indices = {0, 0};
   expect_rejection(store_with_records({}, 0, encode_proof_record(repeated), 1),
-                   PersistenceStatus::INTERNAL_INCONSISTENCY, false, limits, "witness-repeat");
+                   PersistenceStatus::INVALID_WITNESS, false, limits, "witness-repeat");
 
   DiversityProof out_of_range = store.proof;
   out_of_range.witness.present = true;
@@ -483,7 +492,7 @@ PD_TEST(invalid_witness_subsets_are_refused) {
   out_of_range.witness.achieved = 2;
   out_of_range.witness.indices = {0, 9};
   expect_rejection(store_with_records({}, 0, encode_proof_record(out_of_range), 1),
-                   PersistenceStatus::INTERNAL_INCONSISTENCY, false, limits, "witness-range");
+                   PersistenceStatus::INVALID_WITNESS, false, limits, "witness-range");
 }
 
 PD_TEST(invalid_policy_encodings_are_refused) {
@@ -494,17 +503,17 @@ PD_TEST(invalid_policy_encodings_are_refused) {
   DiversityPolicy unknown_class = store.contents.policies.front();
   unknown_class.required_classes.front() = static_cast<DiversityClass>(99);
   expect_rejection(store_with_records(encode_policy_record(unknown_class), 1, {}, 0),
-                   PersistenceStatus::INTERNAL_INCONSISTENCY, false, limits, "policy-class");
+                   PersistenceStatus::INVALID_ENUM, false, limits, "policy-class");
 
   DiversityPolicy unknown_exemption = store.contents.policies.front();
   unknown_exemption.endpoint_exemption = static_cast<EndpointExemption>(77);
   expect_rejection(store_with_records(encode_policy_record(unknown_exemption), 1, {}, 0),
-                   PersistenceStatus::INTERNAL_INCONSISTENCY, false, limits, "policy-exemption");
+                   PersistenceStatus::INVALID_ENUM, false, limits, "policy-exemption");
 
   DiversityPolicy unset_generation = store.contents.policies.front();
   unset_generation.generation = DiversityPolicyGeneration();
   expect_rejection(store_with_records(encode_policy_record(unset_generation), 1, {}, 0),
-                   PersistenceStatus::INTERNAL_INCONSISTENCY, false, limits, "policy-generation");
+                   PersistenceStatus::IMPOSSIBLE_GENERATION, false, limits, "policy-generation");
 
   // The record codec names the exact cause for each of them.
   for (const DiversityPolicy& policy :
@@ -520,7 +529,7 @@ PD_TEST(invalid_policy_encodings_are_refused) {
   missing_relations.required_classes = {DiversityClass::FAILURE_DOMAIN_DISJOINT};
   missing_relations.allowed_failure_domain_relations.clear();
   expect_rejection(store_with_records(encode_policy_record(missing_relations), 1, {}, 0),
-                   PersistenceStatus::INTERNAL_INCONSISTENCY, false, limits, "policy-relations");
+                   PersistenceStatus::INVALID_ENUM, false, limits, "policy-relations");
 }
 
 PD_TEST(impossible_generations_are_refused) {
@@ -548,7 +557,7 @@ PD_TEST(impossible_generations_are_refused) {
   };
   for (int field = 0; field < 4; ++field) {
     expect_rejection(store_with_records({}, 0, encode_proof_record(mutate(field)), 1),
-                     PersistenceStatus::INTERNAL_INCONSISTENCY, false, limits,
+                     PersistenceStatus::IMPOSSIBLE_GENERATION, false, limits,
                      "zero-generation-" + std::to_string(field));
   }
 
@@ -623,7 +632,91 @@ PD_TEST(malformed_identities_are_refused_with_their_own_status) {
   std::vector<std::uint8_t> proof_record = encode_proof_record(store.proof);
   replace_first(proof_record, "path-one", static_cast<std::uint8_t>(' '));
   expect_rejection(store_with_records({}, 0, proof_record, 1),
-                   PersistenceStatus::INTERNAL_INCONSISTENCY, false, limits, "path-identity");
+                   PersistenceStatus::MALFORMED_IDENTITY, false, limits, "path-identity");
+}
+
+// The mapping itself is a product surface, so it is pinned directly: a future
+// refactor that collapses a recognised corruption back into the generic status
+// fails here rather than silently degrading an operator's diagnosis.
+PD_TEST(decode_failure_maps_to_a_specific_status) {
+  const DecodeFailure unset;
+  PD_CHECK(!unset.classified());
+  PD_CHECK_EQ(persistence_status_for(DecodeStatus::INVALID_ENCODING, unset),
+              PersistenceStatus::INTERNAL_INCONSISTENCY);
+
+  // The non-record statuses keep their own meaning whatever the classification.
+  PD_CHECK_EQ(persistence_status_for(DecodeStatus::OK, unset), PersistenceStatus::OK);
+  PD_CHECK_EQ(persistence_status_for(DecodeStatus::TRUNCATED, unset), PersistenceStatus::TRUNCATED);
+  PD_CHECK_EQ(persistence_status_for(DecodeStatus::LENGTH_OVERRUN, unset),
+              PersistenceStatus::TRUNCATED);
+  PD_CHECK_EQ(persistence_status_for(DecodeStatus::TRAILING_BYTES, unset),
+              PersistenceStatus::TRAILING_BYTES);
+  PD_CHECK_EQ(persistence_status_for(DecodeStatus::LIMIT_EXCEEDED, unset),
+              PersistenceStatus::LIMIT_EXCEEDED);
+
+  // Every declared corruption class survives the mapping unchanged.
+  const PersistenceStatus specific[] = {
+      PersistenceStatus::DUPLICATE_PATH,
+      PersistenceStatus::INVALID_ENUM,
+      PersistenceStatus::IMPOSSIBLE_GENERATION,
+      PersistenceStatus::MATRIX_DIMENSION_MISMATCH,
+      PersistenceStatus::UNKNOWN_REFERENCE,
+      PersistenceStatus::INCOMPLETE_EVIDENCE_CLAIM,
+      PersistenceStatus::INVALID_WITNESS,
+      PersistenceStatus::ARITHMETIC_OVERFLOW,
+      PersistenceStatus::MALFORMED_IDENTITY,
+      PersistenceStatus::INTERNAL_INCONSISTENCY};
+  for (PersistenceStatus expected : specific) {
+    DecodeFailure failure;
+    failure.classify(expected);
+    PD_CHECK(failure.classified());
+    PD_CHECK_EQ(failure.status, expected);
+    PD_CHECK_EQ(persistence_status_for(DecodeStatus::INVALID_ENCODING, failure), expected);
+    PD_CHECK(is_defined_persistence_status(static_cast<std::uint8_t>(expected)));
+  }
+
+  // A classified failure is sticky through the public decoder as well.
+  const Limits limits;
+  const ValidStore store = make_valid_store(limits);
+  DiversityProof duplicated = store.proof;
+  PD_REQUIRE(duplicated.request.paths.size() == 2);
+  duplicated.request.paths[1].path = duplicated.request.paths[0].path;
+  duplicated.matrix.order[1] = duplicated.request.paths[0].path;
+  const std::vector<std::uint8_t> record = encode_proof_record(duplicated);
+  ByteReader reader(record.data(), record.size());
+  DiversityProof decoded;
+  DecodeFailure failure;
+  PD_CHECK_EQ(decode_proof(reader, limits, decoded, &failure), DecodeStatus::INVALID_ENCODING);
+  PD_CHECK(failure.status == PersistenceStatus::DUPLICATE_PATH);
+  PD_CHECK_EQ(persistence_status_for(reader.status(), failure), PersistenceStatus::DUPLICATE_PATH);
+}
+
+// A varint that is a well-formed number but cannot be represented in the 32-bit
+// field it encodes is an arithmetic overflow, not a malformed encoding.
+PD_TEST(arithmetic_overflow_in_a_record_is_named) {
+  const Limits limits;
+  const std::vector<std::uint8_t> overflow_policy = encode_record([&](ByteWriter& writer) {
+    writer.text("dpol-overflow");
+    writer.u64(1);
+    writer.text("scope-default");
+    writer.varint(1);
+    writer.u8(static_cast<std::uint8_t>(DiversityClass::LINK_DISJOINT));
+    writer.u8(static_cast<std::uint8_t>(EndpointExemption::SHARED_SOURCE_AND_DESTINATION));
+    // 2^32 does not fit the 32-bit minimum-independent-path count.
+    writer.varint(4294967296ULL);
+  });
+  expect_rejection(build_store(1, {{1, overflow_policy}, {0, {}}, {0, {}}, {0, {}}, {0, {}}, {0, {}}, {0, {}}}),
+                   PersistenceStatus::ARITHMETIC_OVERFLOW, false, limits,
+                   "policy-minimum-overflow");
+
+  // The same value reaching the public codec carries the same reason.
+  ByteReader reader(overflow_policy.data(), overflow_policy.size());
+  DiversityPolicy decoded;
+  DecodeFailure failure;
+  PD_CHECK_EQ(decode_policy(reader, limits, decoded, &failure), DecodeStatus::INVALID_ENCODING);
+  PD_CHECK(failure.status == PersistenceStatus::ARITHMETIC_OVERFLOW);
+  PD_CHECK_EQ(persistence_status_for(reader.status(), failure),
+              PersistenceStatus::ARITHMETIC_OVERFLOW);
 }
 
 PD_TEST(absurd_counts_and_store_limits_are_refused) {
@@ -729,6 +822,10 @@ PD_TEST(the_rejection_taxonomy_is_distinct) {
       PersistenceStatus::INTEGRITY_FAILURE,   PersistenceStatus::TRAILING_BYTES,
       PersistenceStatus::RECORD_LIMIT_EXCEEDED, PersistenceStatus::SIZE_LIMIT_EXCEEDED,
       PersistenceStatus::MALFORMED_IDENTITY, PersistenceStatus::ABSURD_COUNT,
+      PersistenceStatus::DUPLICATE_PATH, PersistenceStatus::INVALID_ENUM,
+      PersistenceStatus::IMPOSSIBLE_GENERATION, PersistenceStatus::MATRIX_DIMENSION_MISMATCH,
+      PersistenceStatus::UNKNOWN_REFERENCE, PersistenceStatus::INCOMPLETE_EVIDENCE_CLAIM,
+      PersistenceStatus::INVALID_WITNESS, PersistenceStatus::ARITHMETIC_OVERFLOW,
       PersistenceStatus::INTERNAL_INCONSISTENCY};
   PD_CHECK(ledger().size() >= 20);
   for (const auto& entry : ledger()) {

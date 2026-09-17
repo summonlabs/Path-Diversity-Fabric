@@ -1,5 +1,7 @@
 // Path Diversity Fabric 1.0.0 - Summon Software Labs.
 // Apache License 2.0. See LICENSE.
+#include <cstdint>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -10,8 +12,26 @@ namespace path_diversity {
 
 namespace {
 
+// Records the exact corruption class a decoder recognised and fails the reader.
+// Every refusal in this file goes through one of the two helpers below, so the
+// reason and the generic status can never disagree.
+DecodeStatus fail(ByteReader& reader, DecodeFailure* failure, PersistenceStatus status) {
+  if (failure != nullptr) {
+    failure->classify(status);
+  }
+  reader.fail(DecodeStatus::INVALID_ENCODING);
+  return DecodeStatus::INVALID_ENCODING;
+}
+
+// A 32-bit field encoded as a varint whose value does not fit: the encoded
+// number is well formed, it simply cannot be represented in the record.
+bool exceeds_u32(std::uint64_t value) noexcept {
+  return value > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max());
+}
+
 template <class Id>
-DecodeStatus read_id(ByteReader& reader, const Limits& limits, Id& out) {
+DecodeStatus read_id(ByteReader& reader, const Limits& limits, Id& out,
+                     DecodeFailure* failure) {
   std::string text;
   const std::size_t bound = limits.max_identity_length < Id::max_length
                                 ? limits.max_identity_length
@@ -22,8 +42,7 @@ DecodeStatus read_id(ByteReader& reader, const Limits& limits, Id& out) {
   }
   const auto parsed = Id::from_wire(text);
   if (!parsed.has_value()) {
-    reader.fail(DecodeStatus::INVALID_ENCODING);
-    return DecodeStatus::INVALID_ENCODING;
+    return fail(reader, failure, PersistenceStatus::MALFORMED_IDENTITY);
   }
   out = *parsed;
   return DecodeStatus::OK;
@@ -51,7 +70,8 @@ DecodeStatus read_count(ByteReader& reader, std::uint32_t max_allowed, std::uint
 
 void write_conflict(ByteWriter& writer, const SharedResource& conflict) { conflict.encode(writer); }
 
-DecodeStatus read_conflict(ByteReader& reader, const Limits& limits, SharedResource& out) {
+DecodeStatus read_conflict(ByteReader& reader, const Limits& limits, SharedResource& out,
+                           DecodeFailure* failure) {
   std::uint8_t kind = 0;
   if (!reader.u8(kind)) {
     return reader.status();
@@ -61,8 +81,7 @@ DecodeStatus read_conflict(ByteReader& reader, const Limits& limits, SharedResou
     return reader.status();
   }
   if (!is_defined_conflict_class(kind) || !is_defined_domain_relation(relation)) {
-    reader.fail(DecodeStatus::INVALID_ENCODING);
-    return DecodeStatus::INVALID_ENCODING;
+    return fail(reader, failure, PersistenceStatus::INVALID_ENUM);
   }
   out.kind = static_cast<ConflictClass>(kind);
   out.relation = static_cast<DomainRelation>(relation);
@@ -79,9 +98,8 @@ DecodeStatus read_conflict(ByteReader& reader, const Limits& limits, SharedResou
     if (!reader.varint(index)) {
       return reader.status();
     }
-    if (index > 0xffffffffULL) {
-      reader.fail(DecodeStatus::INVALID_ENCODING);
-      return DecodeStatus::INVALID_ENCODING;
+    if (exceeds_u32(index)) {
+      return fail(reader, failure, PersistenceStatus::ARITHMETIC_OVERFLOW);
     }
     out.paths.push_back(static_cast<std::uint32_t>(index));
   }
@@ -100,7 +118,8 @@ void write_class(ByteWriter& writer, const ClassResult& result) {
   writer.text(result.detail);
 }
 
-DecodeStatus read_class(ByteReader& reader, const Limits& limits, ClassResult& out) {
+DecodeStatus read_class(ByteReader& reader, const Limits& limits, ClassResult& out,
+                        DecodeFailure* failure) {
   std::uint8_t klass = 0;
   if (!reader.u8(klass)) {
     return reader.status();
@@ -110,8 +129,7 @@ DecodeStatus read_class(ByteReader& reader, const Limits& limits, ClassResult& o
     return reader.status();
   }
   if (!is_defined_diversity_class(klass) || !is_defined_proof_outcome(outcome)) {
-    reader.fail(DecodeStatus::INVALID_ENCODING);
-    return DecodeStatus::INVALID_ENCODING;
+    return fail(reader, failure, PersistenceStatus::INVALID_ENUM);
   }
   out.klass = static_cast<DiversityClass>(klass);
   out.outcome = static_cast<ProofOutcome>(outcome);
@@ -125,7 +143,7 @@ DecodeStatus read_class(ByteReader& reader, const Limits& limits, ClassResult& o
   out.shared.clear();
   for (std::uint32_t i = 0; i < count; ++i) {
     SharedResource conflict;
-    const DecodeStatus status = read_conflict(reader, limits, conflict);
+    const DecodeStatus status = read_conflict(reader, limits, conflict, failure);
     if (status != DecodeStatus::OK) {
       return status;
     }
@@ -135,8 +153,9 @@ DecodeStatus read_class(ByteReader& reader, const Limits& limits, ClassResult& o
     return reader.status();
   }
   if (out.shared_total < out.shared.size()) {
-    reader.fail(DecodeStatus::INVALID_ENCODING);
-    return DecodeStatus::INVALID_ENCODING;
+    // Structurally impossible rather than semantically wrong: no more specific
+    // public status describes it, so it stays conservatively unclassified.
+    return fail(reader, failure, PersistenceStatus::INTERNAL_INCONSISTENCY);
   }
   if (!reader.text(out.detail, limits.max_persistence_record_bytes / 4U)) {
     return reader.status();
@@ -144,8 +163,7 @@ DecodeStatus read_class(ByteReader& reader, const Limits& limits, ClassResult& o
   if (out.outcome == ProofOutcome::PROVEN_DIVERSE && !out.evidence_complete) {
     // An encoded claim of proven diversity with incomplete evidence is refused
     // rather than trusted.
-    reader.fail(DecodeStatus::INVALID_ENCODING);
-    return DecodeStatus::INVALID_ENCODING;
+    return fail(reader, failure, PersistenceStatus::INCOMPLETE_EVIDENCE_CLAIM);
   }
   return DecodeStatus::OK;
 }
@@ -168,7 +186,8 @@ void write_dependencies(ByteWriter& writer, const DependencyBinding& value) {
   }
 }
 
-DecodeStatus read_dependencies(ByteReader& reader, const Limits& limits, DependencyBinding& out) {
+DecodeStatus read_dependencies(ByteReader& reader, const Limits& limits, DependencyBinding& out,
+                               DecodeFailure* failure) {
   std::uint64_t policy = 0;
   std::uint64_t topology = 0;
   std::uint64_t domains = 0;
@@ -185,8 +204,7 @@ DecodeStatus read_dependencies(ByteReader& reader, const Limits& limits, Depende
     return reader.status();
   }
   if (!is_defined_endpoint_exemption(exemption)) {
-    reader.fail(DecodeStatus::INVALID_ENCODING);
-    return DecodeStatus::INVALID_ENCODING;
+    return fail(reader, failure, PersistenceStatus::INVALID_ENUM);
   }
   out.endpoint_exemption = static_cast<EndpointExemption>(exemption);
   std::uint32_t path_count = 0;
@@ -196,7 +214,7 @@ DecodeStatus read_dependencies(ByteReader& reader, const Limits& limits, Depende
   out.paths.clear();
   for (std::uint32_t i = 0; i < path_count; ++i) {
     PathAuthorityBinding binding;
-    const DecodeStatus status = read_id(reader, limits, binding.path);
+    const DecodeStatus status = read_id(reader, limits, binding.path, failure);
     if (status != DecodeStatus::OK) {
       return status;
     }
@@ -208,8 +226,7 @@ DecodeStatus read_dependencies(ByteReader& reader, const Limits& limits, Depende
     out.paths.push_back(std::move(binding));
   }
   std::uint32_t entity_count = 0;
-  if (read_count(reader, limits.max_topology_dependencies, entity_count) !=
-      DecodeStatus::OK) {
+  if (read_count(reader, limits.max_topology_dependencies, entity_count) != DecodeStatus::OK) {
     return reader.status();
   }
   out.topology_entities.clear();
@@ -219,12 +236,11 @@ DecodeStatus read_dependencies(ByteReader& reader, const Limits& limits, Depende
       return reader.status();
     }
     if (!is_defined_entity_kind(kind)) {
-      reader.fail(DecodeStatus::INVALID_ENCODING);
-      return DecodeStatus::INVALID_ENCODING;
+      return fail(reader, failure, PersistenceStatus::INVALID_ENUM);
     }
     EntityRef entity;
     entity.kind = static_cast<EntityKind>(kind);
-    if (!reader.text(entity.id, Limits().max_identity_length)) {
+    if (!reader.text(entity.id, limits.max_identity_length)) {
       return reader.status();
     }
     out.topology_entities.push_back(std::move(entity));
@@ -243,7 +259,8 @@ void write_witness(ByteWriter& writer, const WitnessSubset& value) {
   }
 }
 
-DecodeStatus read_witness(ByteReader& reader, const Limits& limits, WitnessSubset& out) {
+DecodeStatus read_witness(ByteReader& reader, const Limits& limits, WitnessSubset& out,
+                          DecodeFailure* failure) {
   if (!reader.boolean(out.present)) {
     return reader.status();
   }
@@ -254,6 +271,9 @@ DecodeStatus read_witness(ByteReader& reader, const Limits& limits, WitnessSubse
   }
   if (!reader.boolean(out.maximum_exact)) {
     return reader.status();
+  }
+  if (exceeds_u32(requested) || exceeds_u32(achieved)) {
+    return fail(reader, failure, PersistenceStatus::ARITHMETIC_OVERFLOW);
   }
   out.requested_k = static_cast<std::uint32_t>(requested);
   out.achieved = static_cast<std::uint32_t>(achieved);
@@ -267,6 +287,9 @@ DecodeStatus read_witness(ByteReader& reader, const Limits& limits, WitnessSubse
     if (!reader.varint(index)) {
       return reader.status();
     }
+    if (exceeds_u32(index)) {
+      return fail(reader, failure, PersistenceStatus::ARITHMETIC_OVERFLOW);
+    }
     out.indices.push_back(static_cast<std::uint32_t>(index));
   }
   // The named subset may be larger than the proven achievement: an evaluation
@@ -274,19 +297,37 @@ DecodeStatus read_witness(ByteReader& reader, const Limits& limits, WitnessSubse
   // caller can see which paths would be independent once that evidence arrives.
   // A named subset smaller than the proven achievement is a contradiction.
   if (out.indices.size() < out.achieved) {
-    reader.fail(DecodeStatus::INVALID_ENCODING);
-    return DecodeStatus::INVALID_ENCODING;
+    return fail(reader, failure, PersistenceStatus::INVALID_WITNESS);
   }
   for (std::size_t i = 1; i < out.indices.size(); ++i) {
     if (!(out.indices[i - 1] < out.indices[i])) {
-      reader.fail(DecodeStatus::INVALID_ENCODING);
-      return DecodeStatus::INVALID_ENCODING;
+      return fail(reader, failure, PersistenceStatus::INVALID_WITNESS);
     }
   }
   return DecodeStatus::OK;
 }
 
 }  // namespace
+
+PersistenceStatus persistence_status_for(DecodeStatus status,
+                                         const DecodeFailure& failure) noexcept {
+  switch (status) {
+    case DecodeStatus::OK:
+      return PersistenceStatus::OK;
+    case DecodeStatus::TRUNCATED:
+    case DecodeStatus::LENGTH_OVERRUN:
+      return PersistenceStatus::TRUNCATED;
+    case DecodeStatus::TRAILING_BYTES:
+      return PersistenceStatus::TRAILING_BYTES;
+    case DecodeStatus::LIMIT_EXCEEDED:
+      return PersistenceStatus::LIMIT_EXCEEDED;
+    case DecodeStatus::INVALID_ENCODING:
+      // A recognised corruption keeps its exact reason; an unclassified
+      // structural failure stays conservatively generic.
+      return failure.classified() ? failure.status : PersistenceStatus::INTERNAL_INCONSISTENCY;
+  }
+  return PersistenceStatus::INTERNAL_INCONSISTENCY;
+}
 
 void encode_policy(ByteWriter& writer, const DiversityPolicy& policy) {
   write_id(writer, policy.id);
@@ -309,8 +350,9 @@ void encode_policy(ByteWriter& writer, const DiversityPolicy& policy) {
   writer.text(policy.description);
 }
 
-DecodeStatus decode_policy(ByteReader& reader, const Limits& limits, DiversityPolicy& out) {
-  const DecodeStatus id_status = read_id(reader, limits, out.id);
+DecodeStatus decode_policy(ByteReader& reader, const Limits& limits, DiversityPolicy& out,
+                           DecodeFailure* failure) {
+  const DecodeStatus id_status = read_id(reader, limits, out.id, failure);
   if (id_status != DecodeStatus::OK) {
     return id_status;
   }
@@ -319,7 +361,7 @@ DecodeStatus decode_policy(ByteReader& reader, const Limits& limits, DiversityPo
     return reader.status();
   }
   out.generation = DiversityPolicyGeneration::from_value(generation);
-  const DecodeStatus scope_status = read_id(reader, limits, out.scope);
+  const DecodeStatus scope_status = read_id(reader, limits, out.scope, failure);
   if (scope_status != DecodeStatus::OK) {
     return scope_status;
   }
@@ -334,8 +376,7 @@ DecodeStatus decode_policy(ByteReader& reader, const Limits& limits, DiversityPo
       return reader.status();
     }
     if (!is_defined_diversity_class(klass)) {
-      reader.fail(DecodeStatus::INVALID_ENCODING);
-      return DecodeStatus::INVALID_ENCODING;
+      return fail(reader, failure, PersistenceStatus::INVALID_ENUM);
     }
     out.required_classes.push_back(static_cast<DiversityClass>(klass));
   }
@@ -344,13 +385,15 @@ DecodeStatus decode_policy(ByteReader& reader, const Limits& limits, DiversityPo
     return reader.status();
   }
   if (!is_defined_endpoint_exemption(exemption)) {
-    reader.fail(DecodeStatus::INVALID_ENCODING);
-    return DecodeStatus::INVALID_ENCODING;
+    return fail(reader, failure, PersistenceStatus::INVALID_ENUM);
   }
   out.endpoint_exemption = static_cast<EndpointExemption>(exemption);
   std::uint64_t minimum = 0;
   if (!reader.varint(minimum)) {
     return reader.status();
+  }
+  if (exceeds_u32(minimum)) {
+    return fail(reader, failure, PersistenceStatus::ARITHMETIC_OVERFLOW);
   }
   out.minimum_independent_paths = static_cast<std::uint32_t>(minimum);
   std::uint8_t semantics = 0;
@@ -362,8 +405,7 @@ DecodeStatus decode_policy(ByteReader& reader, const Limits& limits, DiversityPo
   if (!is_defined_set_semantics(semantics) ||
       !is_defined_completeness_requirement(completeness) ||
       !is_defined_unknown_behavior(unknown)) {
-    reader.fail(DecodeStatus::INVALID_ENCODING);
-    return DecodeStatus::INVALID_ENCODING;
+    return fail(reader, failure, PersistenceStatus::INVALID_ENUM);
   }
   out.semantics = static_cast<SetSemantics>(semantics);
   out.completeness = static_cast<CompletenessRequirement>(completeness);
@@ -379,8 +421,7 @@ DecodeStatus decode_policy(ByteReader& reader, const Limits& limits, DiversityPo
       return reader.status();
     }
     if (!is_defined_domain_relation(relation)) {
-      reader.fail(DecodeStatus::INVALID_ENCODING);
-      return DecodeStatus::INVALID_ENCODING;
+      return fail(reader, failure, PersistenceStatus::INVALID_ENUM);
     }
     out.allowed_failure_domain_relations.push_back(static_cast<DomainRelation>(relation));
   }
@@ -392,8 +433,18 @@ DecodeStatus decode_policy(ByteReader& reader, const Limits& limits, DiversityPo
   }
   const PolicyValidation validation = validate_policy(out, limits);
   if (!validation.ok()) {
-    reader.fail(DecodeStatus::INVALID_ENCODING);
-    return DecodeStatus::INVALID_ENCODING;
+    // The policy decoder's own validation collapses several distinct policy
+    // defects, so the two that have a precise public status are named and the
+    // rest are reported as an illegal policy encoding.
+    switch (validation.status) {
+      case PolicyStatus::UNSET_GENERATION:
+        return fail(reader, failure, PersistenceStatus::IMPOSSIBLE_GENERATION);
+      case PolicyStatus::INVALID_IDENTITY:
+      case PolicyStatus::INVALID_SCOPE:
+        return fail(reader, failure, PersistenceStatus::MALFORMED_IDENTITY);
+      default:
+        return fail(reader, failure, PersistenceStatus::INVALID_ENUM);
+    }
   }
   return DecodeStatus::OK;
 }
@@ -460,8 +511,9 @@ void encode_proof(ByteWriter& writer, const DiversityProof& proof) {
   writer.u8(static_cast<std::uint8_t>(proof.currentness));
 }
 
-DecodeStatus decode_proof(ByteReader& reader, const Limits& limits, DiversityProof& out) {
-  const DecodeStatus id_status = read_id(reader, limits, out.id);
+DecodeStatus decode_proof(ByteReader& reader, const Limits& limits, DiversityProof& out,
+                          DecodeFailure* failure) {
+  const DecodeStatus id_status = read_id(reader, limits, out.id, failure);
   if (id_status != DecodeStatus::OK) {
     return id_status;
   }
@@ -470,7 +522,7 @@ DecodeStatus decode_proof(ByteReader& reader, const Limits& limits, DiversityPro
     return reader.status();
   }
   out.generation = DiversityProofGeneration::from_value(generation);
-  const DecodeStatus policy_status = read_id(reader, limits, out.request.policy);
+  const DecodeStatus policy_status = read_id(reader, limits, out.request.policy, failure);
   if (policy_status != DecodeStatus::OK) {
     return policy_status;
   }
@@ -486,7 +538,7 @@ DecodeStatus decode_proof(ByteReader& reader, const Limits& limits, DiversityPro
   out.request.paths.clear();
   for (std::uint32_t i = 0; i < path_count; ++i) {
     PathRef reference;
-    const DecodeStatus status = read_id(reader, limits, reference.path);
+    const DecodeStatus status = read_id(reader, limits, reference.path, failure);
     if (status != DecodeStatus::OK) {
       return status;
     }
@@ -520,8 +572,7 @@ DecodeStatus decode_proof(ByteReader& reader, const Limits& limits, DiversityPro
     return reader.status();
   }
   if (!is_defined_proof_outcome(outcome)) {
-    reader.fail(DecodeStatus::INVALID_ENCODING);
-    return DecodeStatus::INVALID_ENCODING;
+    return fail(reader, failure, PersistenceStatus::INVALID_ENUM);
   }
   out.outcome = static_cast<ProofOutcome>(outcome);
   if (!reader.text(out.detail, limits.max_persistence_record_bytes / 4U)) {
@@ -537,8 +588,7 @@ DecodeStatus decode_proof(ByteReader& reader, const Limits& limits, DiversityPro
       return reader.status();
     }
     if (!is_defined_resource_bound(bound)) {
-      reader.fail(DecodeStatus::INVALID_ENCODING);
-      return DecodeStatus::INVALID_ENCODING;
+      return fail(reader, failure, PersistenceStatus::INVALID_ENUM);
     }
     ResourceLimitNotice notice;
     notice.bound = static_cast<ResourceBound>(bound);
@@ -555,7 +605,7 @@ DecodeStatus decode_proof(ByteReader& reader, const Limits& limits, DiversityPro
   out.classes.clear();
   for (std::uint32_t i = 0; i < class_count; ++i) {
     ClassResult result;
-    const DecodeStatus status = read_class(reader, limits, result);
+    const DecodeStatus status = read_class(reader, limits, result, failure);
     if (status != DecodeStatus::OK) {
       return status;
     }
@@ -568,21 +618,20 @@ DecodeStatus decode_proof(ByteReader& reader, const Limits& limits, DiversityPro
   out.advisories.clear();
   for (std::uint32_t i = 0; i < advisory_count; ++i) {
     ClassResult result;
-    const DecodeStatus status = read_class(reader, limits, result);
+    const DecodeStatus status = read_class(reader, limits, result, failure);
     if (status != DecodeStatus::OK) {
       return status;
     }
     out.advisories.push_back(std::move(result));
   }
   std::uint32_t conflict_count = 0;
-  if (read_count(reader, limits.max_conflicts_per_proof, conflict_count) !=
-      DecodeStatus::OK) {
+  if (read_count(reader, limits.max_conflicts_per_proof, conflict_count) != DecodeStatus::OK) {
     return reader.status();
   }
   out.conflicts.clear();
   for (std::uint32_t i = 0; i < conflict_count; ++i) {
     SharedResource conflict;
-    const DecodeStatus status = read_conflict(reader, limits, conflict);
+    const DecodeStatus status = read_conflict(reader, limits, conflict, failure);
     if (status != DecodeStatus::OK) {
       return status;
     }
@@ -592,8 +641,7 @@ DecodeStatus decode_proof(ByteReader& reader, const Limits& limits, DiversityPro
     return reader.status();
   }
   if (out.conflicts_total < out.conflicts.size()) {
-    reader.fail(DecodeStatus::INVALID_ENCODING);
-    return DecodeStatus::INVALID_ENCODING;
+    return fail(reader, failure, PersistenceStatus::INTERNAL_INCONSISTENCY);
   }
 
   std::uint32_t order_count = 0;
@@ -603,7 +651,7 @@ DecodeStatus decode_proof(ByteReader& reader, const Limits& limits, DiversityPro
   out.matrix.order.clear();
   for (std::uint32_t i = 0; i < order_count; ++i) {
     PathId path;
-    const DecodeStatus status = read_id(reader, limits, path);
+    const DecodeStatus status = read_id(reader, limits, path, failure);
     if (status != DecodeStatus::OK) {
       return status;
     }
@@ -616,8 +664,7 @@ DecodeStatus decode_proof(ByteReader& reader, const Limits& limits, DiversityPro
   if (cell_count != PairwiseMatrix::cell_count(order_count)) {
     // A matrix whose dimensions do not match its own path order is refused;
     // there is no repair that would preserve the meaning of the cells.
-    reader.fail(DecodeStatus::INVALID_ENCODING);
-    return DecodeStatus::INVALID_ENCODING;
+    return fail(reader, failure, PersistenceStatus::MATRIX_DIMENSION_MISMATCH);
   }
   out.matrix.cells.clear();
   for (std::uint32_t i = 0; i < cell_count; ++i) {
@@ -627,9 +674,11 @@ DecodeStatus decode_proof(ByteReader& reader, const Limits& limits, DiversityPro
     if (!reader.varint(left) || !reader.varint(right)) {
       return reader.status();
     }
-    if (left >= order_count || right >= order_count || !(left < right)) {
-      reader.fail(DecodeStatus::INVALID_ENCODING);
-      return DecodeStatus::INVALID_ENCODING;
+    if (left >= order_count || right >= order_count) {
+      return fail(reader, failure, PersistenceStatus::UNKNOWN_REFERENCE);
+    }
+    if (!(left < right)) {
+      return fail(reader, failure, PersistenceStatus::INTERNAL_INCONSISTENCY);
     }
     cell.left = static_cast<std::uint32_t>(left);
     cell.right = static_cast<std::uint32_t>(right);
@@ -642,7 +691,7 @@ DecodeStatus decode_proof(ByteReader& reader, const Limits& limits, DiversityPro
     }
     for (std::uint32_t k = 0; k < pair_classes; ++k) {
       ClassResult result;
-      const DecodeStatus status = read_class(reader, limits, result);
+      const DecodeStatus status = read_class(reader, limits, result, failure);
       if (status != DecodeStatus::OK) {
         return status;
       }
@@ -654,7 +703,7 @@ DecodeStatus decode_proof(ByteReader& reader, const Limits& limits, DiversityPro
     }
     if (has_primary) {
       SharedResource conflict;
-      const DecodeStatus status = read_conflict(reader, limits, conflict);
+      const DecodeStatus status = read_conflict(reader, limits, conflict, failure);
       if (status != DecodeStatus::OK) {
         return status;
       }
@@ -663,11 +712,11 @@ DecodeStatus decode_proof(ByteReader& reader, const Limits& limits, DiversityPro
     out.matrix.cells.push_back(std::move(cell));
   }
 
-  const DecodeStatus witness_status = read_witness(reader, limits, out.witness);
+  const DecodeStatus witness_status = read_witness(reader, limits, out.witness, failure);
   if (witness_status != DecodeStatus::OK) {
     return witness_status;
   }
-  const DecodeStatus dependency_status = read_dependencies(reader, limits, out.dependencies);
+  const DecodeStatus dependency_status = read_dependencies(reader, limits, out.dependencies, failure);
   if (dependency_status != DecodeStatus::OK) {
     return dependency_status;
   }
@@ -676,15 +725,15 @@ DecodeStatus decode_proof(ByteReader& reader, const Limits& limits, DiversityPro
     return reader.status();
   }
   out.provenance.epoch = CoordinatorEpoch::from_value(provenance_epoch);
-  DecodeStatus status = read_id(reader, limits, out.provenance.publisher);
+  DecodeStatus status = read_id(reader, limits, out.provenance.publisher, failure);
   if (status != DecodeStatus::OK) {
     return status;
   }
-  status = read_id(reader, limits, out.provenance.boot);
+  status = read_id(reader, limits, out.provenance.boot, failure);
   if (status != DecodeStatus::OK) {
     return status;
   }
-  status = read_id(reader, limits, out.provenance.attempt);
+  status = read_id(reader, limits, out.provenance.attempt, failure);
   if (status != DecodeStatus::OK) {
     return status;
   }
@@ -694,28 +743,30 @@ DecodeStatus decode_proof(ByteReader& reader, const Limits& limits, DiversityPro
     return reader.status();
   }
   if (!is_defined_lifecycle_state(lifecycle) || !is_defined_currentness(currentness)) {
-    reader.fail(DecodeStatus::INVALID_ENCODING);
-    return DecodeStatus::INVALID_ENCODING;
+    return fail(reader, failure, PersistenceStatus::INVALID_ENUM);
   }
   out.lifecycle = static_cast<LifecycleState>(lifecycle);
   out.currentness = static_cast<Currentness>(currentness);
 
   // --- Semantic validation of the decoded revision ------------------------
   if (has_duplicate_paths(out.request.paths)) {
-    reader.fail(DecodeStatus::INVALID_ENCODING);
-    return DecodeStatus::INVALID_ENCODING;
+    return fail(reader, failure, PersistenceStatus::DUPLICATE_PATH);
+  }
+  if (out.matrix.order.size() != out.request.paths.size()) {
+    // Guarded before the comparison below, which indexes the request path list
+    // by the matrix order position: a longer matrix order would otherwise read
+    // past the end of the path list.
+    return fail(reader, failure, PersistenceStatus::MATRIX_DIMENSION_MISMATCH);
   }
   for (std::size_t i = 0; i < out.matrix.order.size(); ++i) {
     if (!(out.matrix.order[i] == out.request.paths[i].path)) {
-      reader.fail(DecodeStatus::INVALID_ENCODING);
-      return DecodeStatus::INVALID_ENCODING;
+      return fail(reader, failure, PersistenceStatus::MATRIX_DIMENSION_MISMATCH);
     }
   }
   for (const SharedResource& conflict : out.conflicts) {
     for (std::uint32_t index : conflict.paths) {
       if (index >= out.request.paths.size()) {
-        reader.fail(DecodeStatus::INVALID_ENCODING);
-        return DecodeStatus::INVALID_ENCODING;
+        return fail(reader, failure, PersistenceStatus::UNKNOWN_REFERENCE);
       }
     }
   }
@@ -723,8 +774,25 @@ DecodeStatus decode_proof(ByteReader& reader, const Limits& limits, DiversityPro
     for (const SharedResource& conflict : result.shared) {
       for (std::uint32_t index : conflict.paths) {
         if (index >= out.request.paths.size()) {
-          reader.fail(DecodeStatus::INVALID_ENCODING);
-          return DecodeStatus::INVALID_ENCODING;
+          return fail(reader, failure, PersistenceStatus::UNKNOWN_REFERENCE);
+        }
+      }
+    }
+  }
+  for (const PairwiseCell& cell : out.matrix.cells) {
+    for (const ClassResult& result : cell.classes) {
+      for (const SharedResource& conflict : result.shared) {
+        for (std::uint32_t index : conflict.paths) {
+          if (index >= out.request.paths.size()) {
+            return fail(reader, failure, PersistenceStatus::UNKNOWN_REFERENCE);
+          }
+        }
+      }
+    }
+    if (cell.primary_conflict.has_value()) {
+      for (std::uint32_t index : cell.primary_conflict->paths) {
+        if (index >= out.request.paths.size()) {
+          return fail(reader, failure, PersistenceStatus::UNKNOWN_REFERENCE);
         }
       }
     }
@@ -732,19 +800,18 @@ DecodeStatus decode_proof(ByteReader& reader, const Limits& limits, DiversityPro
   if (out.outcome == ProofOutcome::PROVEN_DIVERSE) {
     for (const ClassResult& result : out.classes) {
       if (!result.evidence_complete) {
-        reader.fail(DecodeStatus::INVALID_ENCODING);
-        return DecodeStatus::INVALID_ENCODING;
+        return fail(reader, failure, PersistenceStatus::INCOMPLETE_EVIDENCE_CLAIM);
       }
     }
     if (!out.conflicts.empty()) {
-      reader.fail(DecodeStatus::INVALID_ENCODING);
-      return DecodeStatus::INVALID_ENCODING;
+      // A claim of proven diversity carrying conflict evidence is an
+      // unsupported completeness claim.
+      return fail(reader, failure, PersistenceStatus::INCOMPLETE_EVIDENCE_CLAIM);
     }
   }
   for (std::uint32_t index : out.witness.indices) {
     if (index >= out.request.paths.size()) {
-      reader.fail(DecodeStatus::INVALID_ENCODING);
-      return DecodeStatus::INVALID_ENCODING;
+      return fail(reader, failure, PersistenceStatus::INVALID_WITNESS);
     }
   }
   if (out.lifecycle == LifecycleState::CURRENT) {
@@ -752,8 +819,9 @@ DecodeStatus decode_proof(ByteReader& reader, const Limits& limits, DiversityPro
         !out.dependencies.topology_generation.is_set() ||
         !out.dependencies.failure_domain_generation.is_set() ||
         !out.dependencies.epoch.is_set()) {
-      reader.fail(DecodeStatus::INVALID_ENCODING);
-      return DecodeStatus::INVALID_ENCODING;
+      // A current revision must bind every generation it was evaluated against;
+      // an unset generation can never have been current.
+      return fail(reader, failure, PersistenceStatus::IMPOSSIBLE_GENERATION);
     }
   }
   return DecodeStatus::OK;

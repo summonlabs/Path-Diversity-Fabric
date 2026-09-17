@@ -82,16 +82,26 @@ std::string render_transport_status(TransportStatus status, std::string_view det
 namespace {
 
 #if defined(_WIN32)
+// Winsock initialisation can fail, and a transport that ignored that failure
+// would go on to create sockets on an uninitialised stack. The result is
+// recorded here and every caller refuses cleanly when it is false.
 struct WinsockGuard {
-  WinsockGuard() {
-    WSADATA data;
-    WSAStartup(MAKEWORD(2, 2), &data);
+  WinsockGuard() : ready(WSAStartup(MAKEWORD(2, 2), &data) == 0) {}
+  ~WinsockGuard() {
+    if (ready) {
+      WSACleanup();
+    }
   }
-  ~WinsockGuard() { WSACleanup(); }
+  WSADATA data{};
+  bool ready = false;
 };
-void ensure_winsock() { static WinsockGuard guard; }
+
+bool ensure_winsock() {
+  static WinsockGuard guard;
+  return guard.ready;
+}
 #else
-void ensure_winsock() {}
+bool ensure_winsock() { return true; }
 #endif
 
 void close_socket(socket_handle handle) {
@@ -122,22 +132,33 @@ bool send_all(socket_handle handle, const std::uint8_t* data, std::size_t size) 
   return true;
 }
 
+// Reads one chunk and appends it to the caller's buffer. The receive buffer is
+// the caller's vector rather than a stack array: a per-connection thread stack
+// must not carry a fixed sixteen-kilobyte frame buffer.
+constexpr std::size_t kReceiveChunkBytes = 16384;
+
 bool recv_some(socket_handle handle, std::vector<std::uint8_t>& buffer) {
-  std::uint8_t chunk[16384];
+  const std::size_t offset = buffer.size();
+  buffer.resize(offset + kReceiveChunkBytes);
 #if defined(_WIN32)
-  const int read = ::recv(handle, reinterpret_cast<char*>(chunk), static_cast<int>(sizeof(chunk)), 0);
+  const int read = ::recv(handle, reinterpret_cast<char*>(buffer.data() + offset),
+                          static_cast<int>(kReceiveChunkBytes), 0);
 #else
-  const int read = static_cast<int>(::recv(handle, chunk, sizeof(chunk), 0));
+  const int read =
+      static_cast<int>(::recv(handle, buffer.data() + offset, kReceiveChunkBytes, 0));
 #endif
   if (read <= 0) {
+    buffer.resize(offset);
     return false;
   }
-  buffer.insert(buffer.end(), chunk, chunk + read);
+  buffer.resize(offset + static_cast<std::size_t>(read));
   return true;
 }
 
 socket_handle connect_loopback(const std::string& address, std::uint16_t port) {
-  ensure_winsock();
+  if (!ensure_winsock()) {
+    return kInvalidSocket;
+  }
   socket_handle handle = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (handle == kInvalidSocket) {
     return kInvalidSocket;
@@ -197,19 +218,15 @@ struct DiversityCoordinator::Impl {
   void serve(socket_handle handle) {
     FrameAssembler assembler(limits);
     std::vector<std::uint8_t> buffer;
+    buffer.reserve(kReceiveChunkBytes);
     WorkerBootId boot;
     bool have_boot = false;
-    std::uint8_t chunk[16384];
     while (running.load()) {
-#if defined(_WIN32)
-      const int read = ::recv(handle, reinterpret_cast<char*>(chunk), static_cast<int>(sizeof(chunk)), 0);
-#else
-      const int read = static_cast<int>(::recv(handle, chunk, sizeof(chunk), 0));
-#endif
-      if (read <= 0) {
+      buffer.clear();
+      if (!recv_some(handle, buffer)) {
         break;
       }
-      assembler.append(chunk, static_cast<std::size_t>(read));
+      assembler.append(buffer.data(), buffer.size());
       WireFrame frame;
       while (assembler.next(frame) == WireStatus::OK) {
         handle_frame(handle, frame, boot, have_boot);
@@ -443,7 +460,9 @@ TransportStatus DiversityCoordinator::start(const std::string& address, std::uin
   if (impl_->running.load()) {
     return TransportStatus::ALREADY_STARTED;
   }
-  ensure_winsock();
+  if (!ensure_winsock()) {
+    return TransportStatus::BIND_FAILED;
+  }
   socket_handle handle = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (handle == kInvalidSocket) {
     return TransportStatus::BIND_FAILED;

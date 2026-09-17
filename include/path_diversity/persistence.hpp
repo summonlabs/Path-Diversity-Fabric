@@ -52,6 +52,24 @@ enum class PersistenceStatus : std::uint8_t {
 PATH_DIVERSITY_API std::string_view to_string(PersistenceStatus value) noexcept;
 PATH_DIVERSITY_API bool is_defined_persistence_status(std::uint8_t raw) noexcept;
 
+// The specific semantic corruption a record decoder detected, carried alongside
+// the generic DecodeStatus. A decoder that recognised exactly what was wrong
+// records it here; a decoder that only knows the bytes are unusable leaves the
+// reason unset and the caller stays conservative. This is what keeps a
+// duplicate-path store from being reported as an unclassified internal failure.
+struct PATH_DIVERSITY_API DecodeFailure {
+  PersistenceStatus status = PersistenceStatus::OK;
+
+  bool classified() const noexcept { return status != PersistenceStatus::OK; }
+  void classify(PersistenceStatus value) noexcept { status = value; }
+};
+
+// Maps a decoder outcome onto a public persistence status. An unclassified
+// structural failure stays conservatively INTERNAL_INCONSISTENCY; a classified
+// one keeps its exact reason.
+PATH_DIVERSITY_API PersistenceStatus persistence_status_for(DecodeStatus status,
+                                                            const DecodeFailure& failure) noexcept;
+
 // One durable record of an admitted mutation attempt, so replay detection
 // survives a restart.
 struct PATH_DIVERSITY_API MutationAttemptRecord {
@@ -84,13 +102,16 @@ struct PATH_DIVERSITY_API StoreContents {
 // --- Per record codecs (shared by the durable store and the wire codec) ----
 PATH_DIVERSITY_API void encode_policy(ByteWriter& writer, const DiversityPolicy& policy);
 PATH_DIVERSITY_API DecodeStatus decode_policy(ByteReader& reader, const Limits& limits,
-                                              DiversityPolicy& out);
+                                              DiversityPolicy& out,
+                                              DecodeFailure* failure = nullptr);
 PATH_DIVERSITY_API void encode_proof(ByteWriter& writer, const DiversityProof& proof);
 PATH_DIVERSITY_API DecodeStatus decode_proof(ByteReader& reader, const Limits& limits,
-                                             DiversityProof& out);
+                                             DiversityProof& out,
+                                             DecodeFailure* failure = nullptr);
 PATH_DIVERSITY_API void encode_snapshot(ByteWriter& writer, const ProofSnapshot& snapshot);
 PATH_DIVERSITY_API DecodeStatus decode_snapshot(ByteReader& reader, const Limits& limits,
-                                                ProofSnapshot& out);
+                                                ProofSnapshot& out,
+                                                DecodeFailure* failure = nullptr);
 // --- Whole store ----------------------------------------------------------
 PATH_DIVERSITY_API std::vector<std::uint8_t> encode_store(const StoreContents& contents,
                                                           const Limits& limits);

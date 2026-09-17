@@ -35,22 +35,22 @@ bool read_identifier(ByteReader& reader, const Limits& limits, std::string& out)
   return reader.text(out, limits.max_identity_length);
 }
 
-PersistenceStatus from_decode(DecodeStatus status) {
-  switch (status) {
-    case DecodeStatus::OK:
-      return PersistenceStatus::OK;
-    case DecodeStatus::TRUNCATED:
-      return PersistenceStatus::TRUNCATED;
-    case DecodeStatus::LENGTH_OVERRUN:
-      return PersistenceStatus::TRUNCATED;
-    case DecodeStatus::TRAILING_BYTES:
-      return PersistenceStatus::TRAILING_BYTES;
-    case DecodeStatus::LIMIT_EXCEEDED:
-      return PersistenceStatus::LIMIT_EXCEEDED;
-    case DecodeStatus::INVALID_ENCODING:
-      return PersistenceStatus::INTERNAL_INCONSISTENCY;
+// A record-level decode failure keeps the exact corruption class its decoder
+// recognised; anything the decoder could not classify stays conservatively
+// generic. The mapping itself lives in the library so a caller can test it
+// directly.
+PersistenceStatus from_decode(DecodeStatus status, const DecodeFailure& failure) {
+  return persistence_status_for(status, failure);
+}
+
+// Records the exact corruption class and fails the reader, mirroring the helper
+// the record codecs use.
+DecodeStatus fail(ByteReader& reader, DecodeFailure* failure, PersistenceStatus status) {
+  if (failure != nullptr) {
+    failure->classify(status);
   }
-  return PersistenceStatus::INTERNAL_INCONSISTENCY;
+  reader.fail(DecodeStatus::INVALID_ENCODING);
+  return DecodeStatus::INVALID_ENCODING;
 }
 
 }  // namespace
@@ -133,7 +133,7 @@ void encode_class_list(ByteWriter& writer, const std::vector<ClassResult>& class
 }
 
 DecodeStatus decode_class_list(ByteReader& reader, const Limits& limits,
-                               std::vector<ClassResult>& out) {
+                               std::vector<ClassResult>& out, DecodeFailure* failure) {
   std::uint64_t count = 0;
   if (!reader.varint(count)) {
     return reader.status();
@@ -151,8 +151,7 @@ DecodeStatus decode_class_list(ByteReader& reader, const Limits& limits,
       return reader.status();
     }
     if (!is_defined_diversity_class(klass) || !is_defined_proof_outcome(outcome)) {
-      reader.fail(DecodeStatus::INVALID_ENCODING);
-      return DecodeStatus::INVALID_ENCODING;
+      return fail(reader, failure, PersistenceStatus::INVALID_ENUM);
     }
     result.klass = static_cast<DiversityClass>(klass);
     result.outcome = static_cast<ProofOutcome>(outcome);
@@ -174,8 +173,7 @@ DecodeStatus decode_class_list(ByteReader& reader, const Limits& limits,
         return reader.status();
       }
       if (!is_defined_conflict_class(kind) || !is_defined_domain_relation(relation)) {
-        reader.fail(DecodeStatus::INVALID_ENCODING);
-        return DecodeStatus::INVALID_ENCODING;
+        return fail(reader, failure, PersistenceStatus::INVALID_ENUM);
       }
       SharedResource conflict;
       conflict.kind = static_cast<ConflictClass>(kind);
@@ -195,6 +193,9 @@ DecodeStatus decode_class_list(ByteReader& reader, const Limits& limits,
         std::uint64_t index = 0;
         if (!reader.varint(index)) {
           return reader.status();
+        }
+        if (index > static_cast<std::uint64_t>(0xffffffffULL)) {
+          return fail(reader, failure, PersistenceStatus::ARITHMETIC_OVERFLOW);
         }
         conflict.paths.push_back(static_cast<std::uint32_t>(index));
       }
@@ -230,7 +231,7 @@ void encode_dependency_binding(ByteWriter& writer, const DependencyBinding& valu
 }
 
 DecodeStatus decode_dependency_binding(ByteReader& reader, const Limits& limits,
-                                       DependencyBinding& out) {
+                                       DependencyBinding& out, DecodeFailure* failure) {
   std::uint64_t policy = 0;
   std::uint64_t topology = 0;
   std::uint64_t domains = 0;
@@ -247,8 +248,7 @@ DecodeStatus decode_dependency_binding(ByteReader& reader, const Limits& limits,
     return reader.status();
   }
   if (!is_defined_endpoint_exemption(exemption)) {
-    reader.fail(DecodeStatus::INVALID_ENCODING);
-    return DecodeStatus::INVALID_ENCODING;
+    return fail(reader, failure, PersistenceStatus::INVALID_ENUM);
   }
   out.endpoint_exemption = static_cast<EndpointExemption>(exemption);
   std::uint64_t path_count = 0;
@@ -267,8 +267,7 @@ DecodeStatus decode_dependency_binding(ByteReader& reader, const Limits& limits,
     }
     const auto parsed = PathId::from_wire(text);
     if (!parsed.has_value()) {
-      reader.fail(DecodeStatus::INVALID_ENCODING);
-      return DecodeStatus::INVALID_ENCODING;
+      return fail(reader, failure, PersistenceStatus::MALFORMED_IDENTITY);
     }
     binding.path = *parsed;
     std::uint64_t generation = 0;
@@ -292,8 +291,7 @@ DecodeStatus decode_dependency_binding(ByteReader& reader, const Limits& limits,
       return reader.status();
     }
     if (!is_defined_entity_kind(kind)) {
-      reader.fail(DecodeStatus::INVALID_ENCODING);
-      return DecodeStatus::INVALID_ENCODING;
+      return fail(reader, failure, PersistenceStatus::INVALID_ENUM);
     }
     EntityRef entity;
     entity.kind = static_cast<EntityKind>(kind);
@@ -342,15 +340,15 @@ void encode_snapshot(ByteWriter& writer, const ProofSnapshot& snapshot) {
   writer.bytes(snapshot.digest.bytes().data(), snapshot.digest.bytes().size());
 }
 
-DecodeStatus decode_snapshot(ByteReader& reader, const Limits& limits, ProofSnapshot& out) {
+DecodeStatus decode_snapshot(ByteReader& reader, const Limits& limits, ProofSnapshot& out,
+                             DecodeFailure* failure) {
   std::string text;
   if (!read_identifier(reader, limits, text)) {
     return reader.status();
   }
   const auto id = SnapshotId::from_wire(text);
   if (!id.has_value()) {
-    reader.fail(DecodeStatus::INVALID_ENCODING);
-    return DecodeStatus::INVALID_ENCODING;
+    return fail(reader, failure, PersistenceStatus::MALFORMED_IDENTITY);
   }
   out.id = *id;
   if (!read_identifier(reader, limits, text)) {
@@ -358,8 +356,7 @@ DecodeStatus decode_snapshot(ByteReader& reader, const Limits& limits, ProofSnap
   }
   const auto proof = DiversityProofId::from_wire(text);
   if (!proof.has_value()) {
-    reader.fail(DecodeStatus::INVALID_ENCODING);
-    return DecodeStatus::INVALID_ENCODING;
+    return fail(reader, failure, PersistenceStatus::MALFORMED_IDENTITY);
   }
   out.proof = *proof;
   std::uint64_t generation = 0;
@@ -372,8 +369,7 @@ DecodeStatus decode_snapshot(ByteReader& reader, const Limits& limits, ProofSnap
   }
   const auto policy = DiversityPolicyId::from_wire(text);
   if (!policy.has_value()) {
-    reader.fail(DecodeStatus::INVALID_ENCODING);
-    return DecodeStatus::INVALID_ENCODING;
+    return fail(reader, failure, PersistenceStatus::MALFORMED_IDENTITY);
   }
   out.policy = *policy;
   std::uint64_t policy_generation = 0;
@@ -397,8 +393,7 @@ DecodeStatus decode_snapshot(ByteReader& reader, const Limits& limits, ProofSnap
     }
     const auto parsed = PathId::from_wire(text);
     if (!parsed.has_value()) {
-      reader.fail(DecodeStatus::INVALID_ENCODING);
-      return DecodeStatus::INVALID_ENCODING;
+      return fail(reader, failure, PersistenceStatus::MALFORMED_IDENTITY);
     }
     reference.path = *parsed;
     std::uint64_t authority = 0;
@@ -413,11 +408,10 @@ DecodeStatus decode_snapshot(ByteReader& reader, const Limits& limits, ProofSnap
     return reader.status();
   }
   if (!is_defined_proof_outcome(outcome)) {
-    reader.fail(DecodeStatus::INVALID_ENCODING);
-    return DecodeStatus::INVALID_ENCODING;
+    return fail(reader, failure, PersistenceStatus::INVALID_ENUM);
   }
   out.outcome = static_cast<ProofOutcome>(outcome);
-  DecodeStatus status = decode_class_list(reader, limits, out.classes);
+  DecodeStatus status = decode_class_list(reader, limits, out.classes, failure);
   if (status != DecodeStatus::OK) {
     return status;
   }
@@ -437,8 +431,7 @@ DecodeStatus decode_snapshot(ByteReader& reader, const Limits& limits, ProofSnap
       return reader.status();
     }
     if (!is_defined_conflict_class(kind) || !is_defined_domain_relation(relation)) {
-      reader.fail(DecodeStatus::INVALID_ENCODING);
-      return DecodeStatus::INVALID_ENCODING;
+      return fail(reader, failure, PersistenceStatus::INVALID_ENUM);
     }
     SharedResource conflict;
     conflict.kind = static_cast<ConflictClass>(kind);
@@ -460,8 +453,7 @@ DecodeStatus decode_snapshot(ByteReader& reader, const Limits& limits, ProofSnap
         return reader.status();
       }
       if (index >= path_count) {
-        reader.fail(DecodeStatus::INVALID_ENCODING);
-        return DecodeStatus::INVALID_ENCODING;
+        return fail(reader, failure, PersistenceStatus::UNKNOWN_REFERENCE);
       }
       conflict.paths.push_back(static_cast<std::uint32_t>(index));
     }
@@ -495,12 +487,11 @@ DecodeStatus decode_snapshot(ByteReader& reader, const Limits& limits, ProofSnap
       return reader.status();
     }
     if (index >= path_count) {
-      reader.fail(DecodeStatus::INVALID_ENCODING);
-      return DecodeStatus::INVALID_ENCODING;
+      return fail(reader, failure, PersistenceStatus::INVALID_WITNESS);
     }
     out.witness.indices.push_back(static_cast<std::uint32_t>(index));
   }
-  status = decode_dependency_binding(reader, limits, out.dependencies);
+  status = decode_dependency_binding(reader, limits, out.dependencies, failure);
   if (status != DecodeStatus::OK) {
     return status;
   }
@@ -510,8 +501,7 @@ DecodeStatus decode_snapshot(ByteReader& reader, const Limits& limits, ProofSnap
     return reader.status();
   }
   if (!is_defined_lifecycle_state(lifecycle) || !is_defined_currentness(currentness)) {
-    reader.fail(DecodeStatus::INVALID_ENCODING);
-    return DecodeStatus::INVALID_ENCODING;
+    return fail(reader, failure, PersistenceStatus::INVALID_ENUM);
   }
   out.lifecycle = static_cast<LifecycleState>(lifecycle);
   out.currentness = static_cast<Currentness>(currentness);
@@ -525,8 +515,7 @@ DecodeStatus decode_snapshot(ByteReader& reader, const Limits& limits, ProofSnap
   }
   const auto publisher = PublisherId::from_wire(text);
   if (!publisher.has_value()) {
-    reader.fail(DecodeStatus::INVALID_ENCODING);
-    return DecodeStatus::INVALID_ENCODING;
+    return fail(reader, failure, PersistenceStatus::MALFORMED_IDENTITY);
   }
   out.provenance.publisher = *publisher;
   if (!read_identifier(reader, limits, text)) {
@@ -534,8 +523,7 @@ DecodeStatus decode_snapshot(ByteReader& reader, const Limits& limits, ProofSnap
   }
   const auto boot = WorkerBootId::from_wire(text);
   if (!boot.has_value()) {
-    reader.fail(DecodeStatus::INVALID_ENCODING);
-    return DecodeStatus::INVALID_ENCODING;
+    return fail(reader, failure, PersistenceStatus::MALFORMED_IDENTITY);
   }
   out.provenance.boot = *boot;
   if (!read_identifier(reader, limits, text)) {
@@ -543,8 +531,7 @@ DecodeStatus decode_snapshot(ByteReader& reader, const Limits& limits, ProofSnap
   }
   const auto attempt = MutationAttemptId::from_wire(text);
   if (!attempt.has_value()) {
-    reader.fail(DecodeStatus::INVALID_ENCODING);
-    return DecodeStatus::INVALID_ENCODING;
+    return fail(reader, failure, PersistenceStatus::MALFORMED_IDENTITY);
   }
   out.provenance.attempt = *attempt;
 
@@ -561,8 +548,9 @@ DecodeStatus decode_snapshot(ByteReader& reader, const Limits& limits, ProofSnap
   // content and a mismatch is a refusal.
   const Digest recomputed = snapshot_digest(out);
   if (!(recomputed == decoded)) {
-    reader.fail(DecodeStatus::INVALID_ENCODING);
-    return DecodeStatus::INVALID_ENCODING;
+    // The record's own digest disagrees with its content. No more specific
+    // public status names this, so it stays conservatively unclassified.
+    return fail(reader, failure, PersistenceStatus::INTERNAL_INCONSISTENCY);
   }
   out.digest = recomputed;
   out.id = derived_snapshot_id(recomputed);
@@ -714,10 +702,12 @@ PersistenceStatus decode_store(const std::uint8_t* data, std::size_t size, const
   }
   for (std::uint32_t i = 0; i < count; ++i) {
     DiversityPolicy policy;
-    const DecodeStatus status = decode_policy(reader, limits, policy);
+    DecodeFailure failure;
+    const DecodeStatus status = decode_policy(reader, limits, policy, &failure);
     if (status != DecodeStatus::OK) {
-      detail = "policy record " + std::to_string(i) + " failed to decode";
-      return from_decode(status);
+      detail = "policy record " + std::to_string(i) + " failed to decode (" +
+               std::string(to_string(persistence_status_for(status, failure))) + ")";
+      return from_decode(status, failure);
     }
     out.policies.push_back(std::move(policy));
   }
@@ -728,10 +718,12 @@ PersistenceStatus decode_store(const std::uint8_t* data, std::size_t size, const
   }
   for (std::uint32_t i = 0; i < count; ++i) {
     DiversityProof proof;
-    const DecodeStatus status = decode_proof(reader, limits, proof);
+    DecodeFailure failure;
+    const DecodeStatus status = decode_proof(reader, limits, proof, &failure);
     if (status != DecodeStatus::OK) {
-      detail = "proof record " + std::to_string(i) + " failed to decode";
-      return from_decode(status);
+      detail = "proof record " + std::to_string(i) + " failed to decode (" +
+               std::string(to_string(persistence_status_for(status, failure))) + ")";
+      return from_decode(status, failure);
     }
     out.proofs.push_back(std::move(proof));
   }
@@ -843,11 +835,13 @@ PersistenceStatus decode_store(const std::uint8_t* data, std::size_t size, const
     std::vector<DiversityProof> retained;
     for (std::uint64_t k = 0; k < revisions; ++k) {
       DiversityProof proof;
-      const DecodeStatus status = decode_proof(reader, limits, proof);
+      DecodeFailure failure;
+      const DecodeStatus status = decode_proof(reader, limits, proof, &failure);
       if (status != DecodeStatus::OK) {
         detail = "history revision " + std::to_string(k) + " of record " + std::to_string(i) +
-                 " failed to decode";
-        return from_decode(status);
+                 " failed to decode (" +
+                 std::string(to_string(persistence_status_for(status, failure))) + ")";
+        return from_decode(status, failure);
       }
       retained.push_back(std::move(proof));
     }
@@ -860,10 +854,12 @@ PersistenceStatus decode_store(const std::uint8_t* data, std::size_t size, const
   }
   for (std::uint32_t i = 0; i < count; ++i) {
     ProofSnapshot snapshot;
-    const DecodeStatus status = decode_snapshot(reader, limits, snapshot);
+    DecodeFailure failure;
+    const DecodeStatus status = decode_snapshot(reader, limits, snapshot, &failure);
     if (status != DecodeStatus::OK) {
-      detail = "snapshot record " + std::to_string(i) + " failed to decode";
-      return from_decode(status);
+      detail = "snapshot record " + std::to_string(i) + " failed to decode (" +
+               std::string(to_string(persistence_status_for(status, failure))) + ")";
+      return from_decode(status, failure);
     }
     out.snapshots.push_back(std::move(snapshot));
   }
