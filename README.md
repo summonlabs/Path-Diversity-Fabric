@@ -1,7 +1,7 @@
 # Path Diversity Fabric 1.0.0
 
-Path Diversity Fabric is the authoritative path-independence and diversity-proof runtime of
-the Distributed Fabric Infrastructure / Fabric OS stack. It answers exactly one question:
+Path Diversity Fabric is the authoritative path-independence and diversity-proof runtime for
+data-center fabric infrastructure. It answers exactly one question:
 
 > Given two or more exact current candidate or authorized paths and an explicit diversity
 > requirement, are those paths genuinely independent under the current topology and
