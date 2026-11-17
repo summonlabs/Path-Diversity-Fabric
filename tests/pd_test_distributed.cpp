@@ -430,6 +430,24 @@ PD_TEST(coordinator_restart_recovers_history_and_advances_epoch) {
   PD_CHECK(!worker.running());
 }
 
+PD_TEST(a_second_coordinator_cannot_take_a_listening_port) {
+  Limits limits;
+  InMemoryEvidence evidence;
+  seed_scenario(evidence);
+  PublicationAuthority publication(limits);
+  DiversityRuntime runtime(evidence, evidence, evidence, publication, limits);
+  DiversityCoordinator first(runtime, limits);
+  const bool first_started = first.start(kCoordinatorAddress, 0) == TransportStatus::OK;
+  DiversityCoordinator second(runtime, limits);
+  // Two coordinators must never share one listening port: the second start fails.
+  const bool second_started =
+      first_started && second.start(kCoordinatorAddress, first.port()) == TransportStatus::OK;
+  (void)second.stop();
+  (void)first.stop();
+  PD_CHECK(first_started);
+  PD_CHECK(!second_started);
+}
+
 int main(int argc, char** argv) {
   if (argc >= 3 && std::string(argv[1]) == "--coordinator") {
     return run_coordinator(std::filesystem::path(argv[2]));

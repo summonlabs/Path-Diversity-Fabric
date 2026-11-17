@@ -4,10 +4,12 @@
 // Durable-store coverage. Every assertion runs against the shipped codec and
 // the shipped runtime: the suite never re-implements the encoding it checks.
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "test_support.hpp"
@@ -606,6 +608,37 @@ PD_TEST(decoding_is_byte_deterministic) {
   std::error_code error;
   std::filesystem::remove(first, error);
   std::filesystem::remove(second, error);
+}
+
+PD_TEST(store_replacement_waits_for_a_reader_to_close) {
+  const std::filesystem::path root = pd_test::unique_test_path("reader");
+  std::error_code error;
+  std::filesystem::create_directories(root, error);
+  const std::filesystem::path target = root / "store.pds";
+  const std::vector<std::uint8_t> first(64, static_cast<std::uint8_t>(0x11));
+  const std::vector<std::uint8_t> second(96, static_cast<std::uint8_t>(0x22));
+  const PersistenceStatus first_written = write_store_atomic(target.string(), first);
+  PersistenceStatus second_written = PersistenceStatus::IO_FAILURE;
+  bool reader_opened = false;
+  {
+    // Another tool reading the store (an inspection, a scan) holds it open while
+    // the store is replaced, and closes it shortly after.
+    std::ifstream reader(target, std::ios::binary);
+    reader_opened = reader.is_open();
+    std::thread writer([&target, &second, &second_written] {
+      second_written = write_store_atomic(target.string(), second);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    reader.close();
+    writer.join();
+  }
+  const bool replaced = read_file(target.string()) == second;
+  std::filesystem::remove_all(root, error);
+  PD_CHECK_EQ(first_written, PersistenceStatus::OK);
+  PD_CHECK(reader_opened);
+  // The write is not lost because a reader had the file open for a moment.
+  PD_CHECK_EQ(second_written, PersistenceStatus::OK);
+  PD_CHECK(replaced);
 }
 
 PD_TEST_MAIN()

@@ -468,8 +468,15 @@ TransportStatus DiversityCoordinator::start(const std::string& address, std::uin
     return TransportStatus::BIND_FAILED;
   }
   int reuse = 1;
+#if defined(_WIN32)
+  // SO_REUSEADDR on Windows lets a second socket bind a port that is still
+  // listening; exclusive use makes that second bind fail instead.
+  ::setsockopt(handle, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&reuse),
+               sizeof(reuse));
+#else
   ::setsockopt(handle, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse),
                sizeof(reuse));
+#endif
   sockaddr_in local{};
   local.sin_family = AF_INET;
   local.sin_port = htons(port);

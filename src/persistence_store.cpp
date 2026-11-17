@@ -1,11 +1,14 @@
 // Path Diversity Fabric 1.0.0 - Summon Software Labs.
 // Apache License 2.0. See LICENSE.
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -902,13 +905,32 @@ PersistenceStatus write_store_atomic(const std::string& path,
     }
   }
   std::error_code error;
-  std::filesystem::rename(temporary, target, error);
-  if (error) {
-    std::error_code ignored;
-    std::filesystem::remove(temporary, ignored);
-    return PersistenceStatus::ATOMIC_REPLACE_FAILURE;
+  // While a reader has the store open (an inspection, an antivirus or indexing
+  // scan) the replacing rename fails on Windows until the reader closes the
+  // file, so it is retried for a bounded time (about 2 s) instead of losing the
+  // write. A directory in the way is not transient and fails at once.
+  for (int attempt = 0;; ++attempt) {
+    std::filesystem::rename(temporary, target, error);
+    if (!error) {
+      return PersistenceStatus::OK;
+    }
+#if defined(_WIN32)
+    // ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION and ERROR_LOCK_VIOLATION.
+    std::error_code kind;
+    const bool transient = error.category() == std::system_category() &&
+                           (error.value() == 5 || error.value() == 32 || error.value() == 33) &&
+                           !std::filesystem::is_directory(target, kind);
+#else
+    const bool transient = false;
+#endif
+    if (!transient || attempt >= 100) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
-  return PersistenceStatus::OK;
+  std::error_code ignored;
+  std::filesystem::remove(temporary, ignored);
+  return PersistenceStatus::ATOMIC_REPLACE_FAILURE;
 }
 
 PersistenceStatus read_store_bytes(const std::string& path, const Limits& limits,
